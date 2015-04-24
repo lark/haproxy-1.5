@@ -514,6 +514,11 @@ OPTIONS_CFLAGS += -DCONFIG_REGPARM=3
 BUILD_OPTIONS  += $(call ignore_implicit,USE_REGPARM)
 endif
 
+ifneq ($(SO_ORIGINAL_DST),)
+OPTIONS_CFLAGS += -DSO_ORIGINAL_DST
+BUILD_OPTIONS  += $(call ignore_implicit,SO_ORIGINAL_DST)
+endif
+
 # report DLMALLOC_SRC only if explicitly specified
 ifneq ($(DLMALLOC_SRC),)
 BUILD_OPTIONS += DLMALLOC_SRC=$(DLMALLOC_SRC)
@@ -554,6 +559,13 @@ OPTIONS_CFLAGS  += -DUSE_SYSCALL_FUTEX
 endif
 endif
 endif
+endif
+
+ifneq ($(USE_SHADOWSOCKS),)
+BUILD_OPTIONS   += $(call ignore_implicit,USE_SHADOWSOCKS)
+OPTIONS_CFLAGS  += -DUSE_SHADOWSOCKS
+OPTIONS_LDFLAGS += $(if $(SSL_LIB),-L$(SSL_LIB)) -lssl -lcrypto
+OPTIONS_OBJS    += src/ss_sock.o
 endif
 
 ifneq ($(USE_PCRE)$(USE_STATIC_PCRE)$(USE_PCRE_JIT),)
