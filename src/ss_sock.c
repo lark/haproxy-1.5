@@ -96,9 +96,20 @@ struct cipher_ctx {
 
 struct ss_sock_ctx {
 	int method;
+	struct {
+		int	len;
+		char	*pos;
+		char	*tail;
+		char	*buf;
+	} s;
+	struct {
+		int	len;
+		char	*pos;
+		char	*tail;
+		char	*buf;
+	} r;
 	unsigned char *e_table;
 	unsigned char *d_table;
-	struct connection *conn;
 	struct cipher_ctx *e_ctx;
 	struct cipher_ctx *d_ctx;
 };
@@ -318,10 +329,9 @@ static int cipher_ctx_init(struct server *srv, struct cipher_ctx *ctx, int enc)
 		return -1;
 
 	EVP_CIPHER_CTX *evp = &ctx->evp;
-	EVP_CIPHER     *cipher = get_cipher(srv->ss_ctx.method);
 
 	EVP_CIPHER_CTX_init(evp);
-	if (!EVP_CipherInit_ex(evp, cipher, NULL, NULL, NULL, enc)) {
+	if (!EVP_CipherInit_ex(evp, get_cipher(srv->ss_ctx.method), NULL, NULL, NULL, enc)) {
 		Alert("failed to initialize cipher %s\n", supported_ciphers[method]);
 		return -1;
 	}
@@ -341,22 +351,20 @@ static void ss_sock_ctx_free(struct ss_sock_ctx *sock_ctx)
 	if (sock_ctx == NULL)
 		return;
 
-	if (sock_ctx->e_ctx) {
+	if (sock_ctx->s.buf)
+		free(sock_ctx->s.buf);
+	if (sock_ctx->r.buf)
+		free(sock_ctx->r.buf);
+
+	if (sock_ctx->e_ctx)
 		free(sock_ctx->e_ctx);
-		sock_ctx->e_ctx = NULL;
-	}
-	if (sock_ctx->d_ctx) {
+	if (sock_ctx->d_ctx)
 		free(sock_ctx->d_ctx);
-		sock_ctx->d_ctx = NULL;
-	}
-	if (sock_ctx->e_table) {
+	if (sock_ctx->e_table)
 		free(sock_ctx->e_table);
-		sock_ctx->e_table = NULL;
-	}
-	if (sock_ctx->d_table) {
+	if (sock_ctx->d_table)
 		free(sock_ctx->d_table);
-		sock_ctx->d_table = NULL;
-	}
+
 	free(sock_ctx);
 }
 
@@ -372,15 +380,29 @@ static int ss_sock_init(struct connection *conn)
 	if (!conn_ctrl_ready(conn))
 		return 0;
 
-	/* connection to shadowsocks server */
+	/* if connection to shadowsocks server */
 	if (objt_server(conn->target)) {
 		srv = objt_server(conn->target);
 		sock_ctx = malloc(sizeof(struct ss_sock_ctx));
 		if (sock_ctx) {
+			memset(sock_ctx, 0, sizeof(struct ss_sock_ctx));
 			sock_ctx->method = srv->ss_ctx.method;
-			sock_ctx->conn = conn;
 			conn->xprt_ctx = sock_ctx;
 		} else {
+			conn->err_code = CO_ER_SYS_MEMLIM;
+			goto out_error;
+		}
+
+		/* buffer */
+		sock_ctx->s.buf = malloc(SS_BUF_SIZE);
+		sock_ctx->s.pos = sock_ctx->s.tail = sock_ctx->s.buf;
+		sock_ctx->s.len = SS_BUF_SIZE;
+
+		sock_ctx->r.buf = malloc(SS_BUF_SIZE);
+		sock_ctx->r.pos = sock_ctx->r.tail = sock_ctx->r.buf;
+		sock_ctx->r.len = SS_BUF_SIZE;
+
+		if (!sock_ctx->s.buf || !sock_ctx->r.buf) {
 			conn->err_code = CO_ER_SYS_MEMLIM;
 			goto out_error;
 		}
@@ -415,9 +437,14 @@ static int ss_sock_init(struct connection *conn)
 		}
 
 		/* leave init state and start pseudo handshake */
-		conn->flags |= CO_FL_WAIT_L6_CONN;
+		conn_data_want_send(conn);
 
 		return 0;
+
+	out_error:
+		ss_sock_ctx_free(sock_ctx);
+		conn->xprt_ctx = NULL;
+		return -1;
 	}
 	/* don't know how to handle it */
 	else {
@@ -425,18 +452,14 @@ static int ss_sock_init(struct connection *conn)
 		return -1;
 	}
 
-out_error:
-	ss_sock_ctx_free(sock_ctx);
-	conn->xprt_ctx = NULL;
-	return -1;
 }
 
-static unsigned char *ss_sock_encrypt(unsigned char *plain, int buf_size, ssize_t *len,
-		                 struct ss_sock_ctx *sock_ctx)
+static char *ss_sock_encrypt(char *plain, int buf_size, ssize_t *len,
+		             struct ss_sock_ctx *sock_ctx)
 {
 	/* using simple table encryption */
 	if (sock_ctx->method == SS_CIPHER_TABLE) {
-		unsigned char *begin;
+		char *begin = plain;
 		while (plain < begin + *len) {
 			*plain = (char) sock_ctx->e_table[(unsigned char)*plain];
 			plain++;
@@ -448,10 +471,71 @@ static unsigned char *ss_sock_encrypt(unsigned char *plain, int buf_size, ssize_
 	return NULL;
 }
 
+static char *ss_sock_decrypt(char *plain, int buf_size, ssize_t *len,
+		             struct ss_sock_ctx *sock_ctx)
+{
+	/* using simple table encryption */
+	if (sock_ctx->method == SS_CIPHER_TABLE) {
+		char *begin = plain;
+		while (plain < begin + *len) {
+			*plain = (char) sock_ctx->d_table[(unsigned char)*plain];
+			plain++;
+		}
+		return begin;
+	}
+
+	/* using cipher */
+	return NULL;
+}
+
+/*
+ * send data in buffer
+ * NOTE: after call, check conn->sock_ctx.tail, if equals to conn->sock_ctx.buf,
+ * all data is sent.
+ */
+/* 0 = error
+ * 1 = socket not ready
+ * 2 = partial send
+ * 3 = all send
+ */
+static int real_send(struct connection *conn)
+{
+	ssize_t ret, try;
+	struct ss_sock_ctx *sock_ctx;
+
+	sock_ctx = (struct ss_sock_ctx *) conn->xprt_ctx;
+
+	try = sock_ctx->s.tail - sock_ctx->s.pos;
+	if (try == 0)
+		goto finished;
+
+	ret = send(conn->t.sock.fd, sock_ctx->s.pos, try, 0);
+
+	if (ret == -1) {
+		if (errno == EAGAIN || errno == ENOTCONN) {
+			fd_cant_send(conn->t.sock.fd);
+			return 1;
+		} else {
+			conn->flags |= CO_FL_ERROR;
+			return 0;
+		}
+	}
+	if (ret < try) {
+		sock_ctx->s.pos += ret;
+		return 2;
+	}
+
+finished:
+	sock_ctx->s.pos = sock_ctx->s.tail = sock_ctx->s.buf;
+
+	return 3;
+}
+
 static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int flags)
 {
-	int ret, try, done;
+	ssize_t ret, try, done = 0;
 	struct ss_sock_ctx *sock_ctx;
+	ssize_t len = 0;
 
 	if (!conn->xprt_ctx)
 		goto out_error;
@@ -462,87 +546,102 @@ static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int fla
 	if (!fd_send_ready(conn->t.sock.fd))
 		return 0;
 
-	done = 0;
 	sock_ctx = (struct ss_sock_ctx *) conn->xprt_ctx;
 
 	/* pseudo handshake: send destaddr to shadowsocks server */
-	if (conn->flags & CO_FL_WAIT_L6_CONN) {
-		char pn[INET6_ADDRSTRLEN];
-		struct session *s = conn->owner;
-		struct connection *cli_conn = objt_conn(s->req->prod->end);
+	if (!conn->xprt_st) {
+		struct session *sess;
+		struct connection *cli_conn;
 
-		unsigned char *ss_addr_to_send = malloc(SS_BUF_SIZE);
-		ssize_t size = 0;
+		sess = conn->owner;
+		cli_conn = objt_conn(sess->req->prod->end);
 
 		if (cli_conn)
 			conn_get_to_addr(cli_conn);
 		else
 			goto out_error;
 
-		if (ss_addr_to_send == NULL)
-			goto out_error;
-
 		if (cli_conn->addr.to.ss_family == AF_INET6) {
-			ss_addr_to_send[size++] = 4;
-			memcpy(ss_addr_to_send + size,
+			sock_ctx->s.buf[len++] = 4;
+			memcpy(sock_ctx->s.buf + len,
 			       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_addr),
 			       sizeof(struct in6_addr));
-			size += sizeof(struct in6_addr);
-			memcpy(ss_addr_to_send + size,
+			len += sizeof(struct in6_addr);
+			memcpy(sock_ctx->s.buf + len,
 			       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_port),
 			       2);
+			len += 2;
 		} else {
-			ss_addr_to_send[size++] = 1;
-			memcpy(ss_addr_to_send + size,
+			sock_ctx->s.buf[len++] = 1;
+			memcpy(sock_ctx->s.buf + len,
 			       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_addr),
 			       sizeof(struct in_addr));
-			size += sizeof(struct in_addr);
-			memcpy(ss_addr_to_send + size,
+			len += sizeof(struct in_addr);
+			memcpy(sock_ctx->s.buf + len,
 			       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_port),
 			       2);
+			len += 2;
 		}
-		size += 2;
-		ss_addr_to_send = ss_sock_encrypt(SS_BUF_SIZE, ss_addr_to_send, &size,
+		sock_ctx->s.buf = ss_sock_encrypt(sock_ctx->s.buf, sock_ctx->s.len, &len,
 					          sock_ctx);
-		if (ss_addr_to_send == NULL) {
+		if (sock_ctx->s.buf == NULL) {
 			conn->err_code = CO_ER_SYS_MEMLIM;
 			goto out_error;
 		}
+		sock_ctx->s.pos = sock_ctx->s.buf;
+		sock_ctx->s.tail = sock_ctx->s.buf + len;
 
-		ret = send(conn->t.sock.fd, ss_addr_to_send, size, 0);
-		free(ss_addr_to_send);
-		conn->flags &= ~ CO_FL_WAIT_L6_CONN;
-
-		if (ret < size)
-			goto out_error;
-		else
-			return 0;
+		conn->xprt_st = 1;
 	}
 
+	ret = real_send(conn);
+	if (ret == 0)
+		goto out_error;
+	else if (ret == 1 || ret == 2)
+		return 0;
+
+	/* we can send data now */
 	while(buf->o) {
 		try = bo_contig_data(buf);
-		if (try > SS_BUF_SIZE)
-			try = SS_BUF_SIZE;
+		if (try > sock_ctx->s.len)
+			try = sock_ctx->s.len;
+
+		memcpy(sock_ctx->s.buf, bo_ptr(buf), try);
+
+		done += try;
+		buf->o -= try;
+
+		len = try;
+		sock_ctx->s.buf = ss_sock_encrypt(sock_ctx->s.buf, sock_ctx->s.len, &len,
+					          sock_ctx);
+		sock_ctx->s.pos = sock_ctx->s.buf;
+		sock_ctx->s.tail = sock_ctx->s.buf + len;
+
+		ret = real_send(conn);
+		if (ret == 0)
+			goto out_error;
+		else if (ret == 1 || ret == 2)
+			return done;
 	}
+	return done;
 
 out_error:
 	conn->flags |= CO_FL_ERROR;
 	return done;
 }
 
-static int ss_sock_to_buf(struct connection *conn, struct buffer *buf, int flags)
+static int ss_sock_to_buf(struct connection *conn, struct buffer *buf, int count)
 {
-	int ret, try, done = 0;
-	int count;
+	ssize_t ret, try, done = 0;
+	struct ss_sock_ctx *sock_ctx;
 
 	if (!conn->xprt_ctx)
 		goto out_error;
 
-	if (conn->flags & CO_FL_HANDSHAKE)
-		return 0;
-
 	if (buffer_empty(buf))
 		buf->p = buf->data;
+
+	sock_ctx = (struct ss_sock_ctx *) conn->xprt_ctx;
 
 	while (count > 0) {
 		/* first check if we have some room after p+i */
@@ -555,10 +654,43 @@ static int ss_sock_to_buf(struct connection *conn, struct buffer *buf, int flags
 		}
 		if (try > count)
 			try = count;
+		if (try > sock_ctx->r.len)
+			try = sock_ctx->r.len;
+
+		ret = recv(conn->t.sock.fd, sock_ctx->r.buf, try, 0);
+		if (ret > 0) {
+			sock_ctx->r.pos = sock_ctx->r.buf;
+			sock_ctx->r.tail = sock_ctx->r.buf + ret;
+			sock_ctx->r.buf = ss_sock_decrypt(sock_ctx->r.buf, sock_ctx->r.len,
+							  &ret, sock_ctx);
+			memcpy(bi_end(buf), sock_ctx->r.buf, ret);
+			buf->i += ret;
+			done += ret;
+
+			if (ret < try)
+				break;
+			count -= ret;
+		}
+		else if (ret == 0)
+			goto read0;
+		else {
+			if (errno == EAGAIN || errno == ENOTCONN) {
+				fd_cant_recv(conn->t.sock.fd);
+				break;
+			}
+			goto out_error;
+		}
+
 	}
+	return done;
+
+read0:
+	conn_sock_read0(conn);
+	return done;
 
 out_error:
-	return 0;
+	conn->flags |= CO_FL_ERROR;
+	return done;
 }
 
 static void ss_sock_close(struct connection *conn)
@@ -571,8 +703,8 @@ static void ss_sock_close(struct connection *conn)
 
 static void ss_sock_shutw(struct connection *conn, int clean)
 {
-	if (conn->flags & CO_FL_HANDSHAKE)
-		return;
+	//if (conn->flags & CO_FL_HANDSHAKE)
+	//	return;
 
 	/* no shakehand in progress, try a clean shutdown */
 	shutdown(conn->t.sock.fd, SHUT_WR);
