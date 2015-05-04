@@ -14,6 +14,7 @@
 
 #include <openssl/ssl.h>
 #include <openssl/md5.h>
+#include <openssl/rand.h>
 
 #include <netinet/tcp.h>
 #include <common/buffer.h>
@@ -88,26 +89,28 @@ enum {
 };
 
 struct cipher_ctx {
-	uint8_t		init;
+	uint32_t	init;
 	uint64_t	counter;
 	EVP_CIPHER_CTX	evp;
-	uint8_t		iv [MAX_IV_LENGTH];
+	uint8_t		iv[EVP_MAX_IV_LENGTH];
 };
 
 struct ss_sock_ctx {
 	int method;
+	int iv_len;
 	struct {
 		int	len;
 		char	*pos;
-		char	*tail;
+		char	*end;
 		char	*buf;
 	} s;
 	struct {
 		int	len;
 		char	*pos;
-		char	*tail;
+		char	*end;
 		char	*buf;
 	} r;
+	uint8_t key[EVP_MAX_KEY_LENGTH];
 	unsigned char *e_table;
 	unsigned char *d_table;
 	struct cipher_ctx *e_ctx;
@@ -244,7 +247,7 @@ static int ss_sock_srv_init_table(struct server *srv, struct proxy *curproxy)
 
 static int ss_sock_srv_init_key(struct server *srv, struct proxy *curproxy)
 {
-	unsigned char      iv[MAX_IV_LENGTH];
+	unsigned char     iv[EVP_MAX_IV_LENGTH];
 	const EVP_CIPHER  *cipher;
 	const EVP_MD      *md;
 
@@ -320,7 +323,7 @@ int ss_sock_prepare_srv_ctx(struct server *srv, struct proxy *curproxy)
 	return cfgerr;
 }
 
-static int cipher_ctx_init(struct server *srv, struct cipher_ctx *ctx, int enc)
+static int cipher_ctx_init(struct cipher_ctx *ctx, struct server *srv, int enc)
 {
 	int method = srv->ss_ctx.method;
 
@@ -343,6 +346,36 @@ static int cipher_ctx_init(struct server *srv, struct cipher_ctx *ctx, int enc)
 	if (srv->ss_ctx.method > SS_CIPHER_RC4_MD5)
 		EVP_CIPHER_CTX_set_padding(evp, 1);
 
+	return 0;
+}
+
+static int ss_sock_ctx_set_iv(struct ss_sock_ctx *sock_ctx, uint8_t *iv,
+			      size_t iv_len, int enc)
+{
+	const unsigned char *true_key;
+	struct cipher_ctx *ctx;
+
+	if (enc) {
+		RAND_bytes(iv, iv_len);
+		ctx = sock_ctx->e_ctx;
+	} else {
+		ctx = sock_ctx->d_ctx;
+	}
+
+	if (sock_ctx->method == SS_CIPHER_RC4_MD5) {
+		unsigned char key_iv[32];
+		memcpy(key_iv, sock_ctx->key, 16);
+		memcpy(key_iv + 16, iv, 16);
+		true_key = MD5(key_iv, 32, NULL);
+		iv_len = 0;
+	} else {
+		true_key = sock_ctx->key;
+	}
+
+	if (!EVP_CipherInit_ex(&ctx->evp, NULL, NULL, true_key, iv, enc)) {
+		EVP_CIPHER_CTX_cleanup(&ctx->evp);
+		return -1;
+	}
 	return 0;
 }
 
@@ -395,11 +428,11 @@ static int ss_sock_init(struct connection *conn)
 
 		/* buffer */
 		sock_ctx->s.buf = malloc(SS_BUF_SIZE);
-		sock_ctx->s.pos = sock_ctx->s.tail = sock_ctx->s.buf;
+		sock_ctx->s.pos = sock_ctx->s.end = sock_ctx->s.buf;
 		sock_ctx->s.len = SS_BUF_SIZE;
 
 		sock_ctx->r.buf = malloc(SS_BUF_SIZE);
-		sock_ctx->r.pos = sock_ctx->r.tail = sock_ctx->r.buf;
+		sock_ctx->r.pos = sock_ctx->r.end = sock_ctx->r.buf;
 		sock_ctx->r.len = SS_BUF_SIZE;
 
 		if (!sock_ctx->s.buf || !sock_ctx->r.buf) {
@@ -423,6 +456,9 @@ static int ss_sock_init(struct connection *conn)
 
 		/* init cipher context */
 		if (srv->ss_ctx.method > SS_CIPHER_TABLE) {
+			memcpy(sock_ctx->key, srv->ss_ctx.key, EVP_MAX_KEY_LENGTH);
+			sock_ctx->iv_len = srv->ss_ctx.iv_len;
+
 			sock_ctx->e_ctx = malloc(sizeof(struct cipher_ctx));
 			sock_ctx->d_ctx = malloc(sizeof(struct cipher_ctx));
 
@@ -431,8 +467,8 @@ static int ss_sock_init(struct connection *conn)
 				goto out_error;
 			}
 
-			if (cipher_ctx_init(srv, sock_ctx->e_ctx, 1)
-			    || cipher_ctx_init(srv, sock_ctx->d_ctx, 0))
+			if (cipher_ctx_init(sock_ctx->e_ctx, srv, 1)
+			    || cipher_ctx_init(sock_ctx->d_ctx, srv, 0))
 				goto out_error;
 		}
 
@@ -471,15 +507,72 @@ static char *ss_sock_encrypt(char *plain, int buf_size, ssize_t *len,
 	return NULL;
 }
 
-static char *ss_sock_decrypt(char *plain, int buf_size, ssize_t *len,
+/* encrypt plain data from provided buffer into s.buf */
+static int ss_sock_encrypt2(struct ss_sock_ctx *sock_ctx, const uint8_t *plain, ssize_t len)
+{
+	char *crypt;
+
+	/* use simple table encryption */
+	if (sock_ctx->method == SS_CIPHER_TABLE) {
+		int n;
+		crypt = sock_ctx->s.buf;
+		for (n = 0; n < len; n++) {
+			crypt[n] = (char) sock_ctx->e_table[(unsigned char)plain[n]];
+		}
+		sock_ctx->s.pos = sock_ctx->s.buf;
+		sock_ctx->s.end = sock_ctx->s.buf + len;
+		return 0;
+	}
+
+	/* use cipher */
+	int p_len = len, c_len = len;
+	int buf_size = c_len;
+	int err;
+	int iv_len = 0;
+
+	/* if first called, we need to send IV to peer */
+	if (!sock_ctx->e_ctx->init)
+		iv_len = sock_ctx->iv_len;
+
+	/* enlarge send buffer if necessary */
+	buf_size += iv_len;
+	if (buf_size > sock_ctx->s.len) {
+		char *tmp = realloc(sock_ctx->s.buf, buf_size);
+		if (tmp) {
+			sock_ctx->s.buf = tmp;
+			sock_ctx->s.len = buf_size;
+		}
+		else
+			return -1;
+	}
+
+	if (!sock_ctx->e_ctx->init) {
+		uint8_t iv[MAX_IV_LENGTH];
+		ss_sock_ctx_set_iv(sock_ctx, iv, iv_len, 1);
+		memcpy(sock_ctx->s.buf, iv, iv_len);
+		sock_ctx->e_ctx->init = 1;
+	}
+
+	err = EVP_CipherUpdate(&sock_ctx->e_ctx->evp,
+			       (uint8_t *)(sock_ctx->s.buf + iv_len), &c_len,
+			       plain, p_len);
+	if (!err)
+		return -1;
+
+	sock_ctx->s.pos = sock_ctx->s.buf;
+	sock_ctx->s.end = sock_ctx->s.buf + iv_len + c_len;
+	return 0;
+}
+
+static char *ss_sock_decrypt(char *crypt, int buf_size, ssize_t *len,
 		             struct ss_sock_ctx *sock_ctx)
 {
 	/* using simple table encryption */
 	if (sock_ctx->method == SS_CIPHER_TABLE) {
-		char *begin = plain;
-		while (plain < begin + *len) {
-			*plain = (char) sock_ctx->d_table[(unsigned char)*plain];
-			plain++;
+		char *begin = crypt;
+		while (crypt < begin + *len) {
+			*crypt = (char) sock_ctx->d_table[(unsigned char)*crypt];
+			crypt++;
 		}
 		return begin;
 	}
@@ -488,9 +581,49 @@ static char *ss_sock_decrypt(char *plain, int buf_size, ssize_t *len,
 	return NULL;
 }
 
+/* decrypt data from r.buf into provided buffer
+ * result maybe smaller then expected */
+static int ss_sock_decrypt2(struct ss_sock_ctx *sock_ctx, uint8_t *plain, ssize_t *len)
+{
+	char *crypt = sock_ctx->r.buf;
+
+	/* using simple table encryption */
+	if (sock_ctx->method == SS_CIPHER_TABLE) {
+		int n;
+		for (n = 0; n < *len; n++) {
+			plain[n] = (char) sock_ctx->d_table[(unsigned char)crypt[n]];
+		}
+		sock_ctx->r.pos = sock_ctx->r.buf;
+		sock_ctx->r.end = sock_ctx->r.buf + *len;
+		return 0;
+	}
+
+	/* use cipher */
+	int p_len = *len, c_len = *len;
+	int err;
+	int iv_len = 0;
+
+	/* the first iv_len bytes is IV we recv */
+	if (!sock_ctx->d_ctx->init) {
+		iv_len = sock_ctx->iv_len;
+		c_len -= iv_len;
+		ss_sock_ctx_set_iv(sock_ctx, (uint8_t *)crypt, iv_len, 0);
+		sock_ctx->d_ctx->init = 1;
+	}
+
+	err = EVP_CipherUpdate(&sock_ctx->d_ctx->evp,
+			       plain, &p_len,
+			       (uint8_t *)(crypt + iv_len), c_len);
+	if (!err)
+		return -1;
+
+	*len = p_len;
+	return 0;
+}
+
 /*
  * send data in buffer
- * NOTE: after call, check conn->sock_ctx.tail, if equals to conn->sock_ctx.buf,
+ * NOTE: after call, check conn->sock_ctx.end, if equals to conn->sock_ctx.buf,
  * all data is sent.
  */
 /* 0 = error
@@ -498,14 +631,14 @@ static char *ss_sock_decrypt(char *plain, int buf_size, ssize_t *len,
  * 2 = partial send
  * 3 = all send
  */
-static int real_send(struct connection *conn)
+static inline int real_send(struct connection *conn)
 {
 	ssize_t ret, try;
 	struct ss_sock_ctx *sock_ctx;
 
 	sock_ctx = (struct ss_sock_ctx *) conn->xprt_ctx;
 
-	try = sock_ctx->s.tail - sock_ctx->s.pos;
+	try = sock_ctx->s.end - sock_ctx->s.pos;
 	if (try == 0)
 		goto finished;
 
@@ -526,7 +659,7 @@ static int real_send(struct connection *conn)
 	}
 
 finished:
-	sock_ctx->s.pos = sock_ctx->s.tail = sock_ctx->s.buf;
+	sock_ctx->s.pos = sock_ctx->s.end = sock_ctx->s.buf;
 
 	return 3;
 }
@@ -552,6 +685,7 @@ static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int fla
 	if (!conn->xprt_st) {
 		struct session *sess;
 		struct connection *cli_conn;
+		char hdr_buf[32];
 
 		sess = conn->owner;
 		cli_conn = objt_conn(sess->req->prod->end);
@@ -562,35 +696,30 @@ static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int fla
 			goto out_error;
 
 		if (cli_conn->addr.to.ss_family == AF_INET6) {
-			sock_ctx->s.buf[len++] = 4;
-			memcpy(sock_ctx->s.buf + len,
+			hdr_buf[len++] = 4;
+			memcpy(hdr_buf + len,
 			       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_addr),
 			       sizeof(struct in6_addr));
 			len += sizeof(struct in6_addr);
-			memcpy(sock_ctx->s.buf + len,
+			memcpy(hdr_buf + len,
 			       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_port),
 			       2);
 			len += 2;
 		} else {
-			sock_ctx->s.buf[len++] = 1;
-			memcpy(sock_ctx->s.buf + len,
+			hdr_buf[len++] = 1;
+			memcpy(hdr_buf + len,
 			       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_addr),
 			       sizeof(struct in_addr));
 			len += sizeof(struct in_addr);
-			memcpy(sock_ctx->s.buf + len,
+			memcpy(hdr_buf + len,
 			       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_port),
 			       2);
 			len += 2;
 		}
-		sock_ctx->s.buf = ss_sock_encrypt(sock_ctx->s.buf, sock_ctx->s.len, &len,
-					          sock_ctx);
-		if (sock_ctx->s.buf == NULL) {
+		if (ss_sock_encrypt2(sock_ctx, (uint8_t *)hdr_buf, len)) {
 			conn->err_code = CO_ER_SYS_MEMLIM;
 			goto out_error;
 		}
-		sock_ctx->s.pos = sock_ctx->s.buf;
-		sock_ctx->s.tail = sock_ctx->s.buf + len;
-
 		conn->xprt_st = 1;
 	}
 
@@ -606,16 +735,11 @@ static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int fla
 		if (try > sock_ctx->s.len)
 			try = sock_ctx->s.len;
 
-		memcpy(sock_ctx->s.buf, bo_ptr(buf), try);
+		if (ss_sock_encrypt2(sock_ctx, (uint8_t *)bo_ptr(buf), try))
+			goto out_error;
 
 		done += try;
 		buf->o -= try;
-
-		len = try;
-		sock_ctx->s.buf = ss_sock_encrypt(sock_ctx->s.buf, sock_ctx->s.len, &len,
-					          sock_ctx);
-		sock_ctx->s.pos = sock_ctx->s.buf;
-		sock_ctx->s.tail = sock_ctx->s.buf + len;
 
 		ret = real_send(conn);
 		if (ret == 0)
@@ -659,13 +783,12 @@ static int ss_sock_to_buf(struct connection *conn, struct buffer *buf, int count
 
 		ret = recv(conn->t.sock.fd, sock_ctx->r.buf, try, 0);
 		if (ret > 0) {
-			sock_ctx->r.pos = sock_ctx->r.buf;
-			sock_ctx->r.tail = sock_ctx->r.buf + ret;
-			sock_ctx->r.buf = ss_sock_decrypt(sock_ctx->r.buf, sock_ctx->r.len,
-							  &ret, sock_ctx);
-			memcpy(bi_end(buf), sock_ctx->r.buf, ret);
-			buf->i += ret;
-			done += ret;
+			ssize_t dec = ret;
+			if (ss_sock_decrypt2(sock_ctx, (uint8_t *)bi_end(buf), &dec)) {
+				return -1;
+			}
+			buf->i += dec;
+			done += dec;
 
 			if (ret < try)
 				break;
@@ -758,7 +881,7 @@ static int srv_parse_method(char **args, int *cur_arg, struct proxy *px, struct 
 		newsrv->ss_ctx.method = SS_CIPHER_SEED_CFB;
 	else {
 		if (err)
-			memprintf(err, "'%s' : unknown crypto '%s', only table, rc4, rc4-md5, aes-128-cfb, aes-192-cfb, aes-256-cfb, bf-cfb, camellia-128-cfb, camellia-192-cfb, camellia-256-cfb, cast5-cfb, des-cfb, idea-cfb, rc2-cfb, seed-cfb, salsa20, chacha20 are supported\n",
+			memprintf(err, "'%s' : unknown crypto '%s', only table, rc4, rc4-md5, aes-128-cfb, aes-192-cfb, aes-256-cfb, bf-cfb, camellia-128-cfb, camellia-192-cfb, camellia-256-cfb, cast5-cfb, des-cfb, idea-cfb, rc2-cfb, seed-cfb are supported\n",
 				  args[*cur_arg], args[*cur_arg + 1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
