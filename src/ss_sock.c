@@ -1,3 +1,17 @@
+/*
+ * SHADOWSOCKS transport layer over SOCK_STREAM sockets
+ *
+ * Copyright (C) 2015 Wang Jian <larkwang@gmail.com>
+ *
+ * crypto code partly based on shadowsocks-libev:
+ *     https://github.com/shadowsocks/shadowsocks-libev
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version
+ * 2 of the License, or (at your option) any later version.
+ */
+
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <dirent.h>
